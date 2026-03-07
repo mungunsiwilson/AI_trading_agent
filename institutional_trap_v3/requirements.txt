@@ -1,0 +1,44 @@
+# Institutional Trap v3.0 - Requirements
+
+# Async I/O and HTTP
+aiohttp>=3.9.0
+websockets>=12.0
+uvloop>=0.19.0; platform_system != "Windows"
+
+# Exchange integration (Binance fallback)
+ccxt>=4.2.0
+ccxt.pro>=0.12.0
+
+# Data processing
+numpy>=1.26.0
+pandas>=2.0.0
+orjson>=3.9.0
+sortedcontainers>=2.4.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Telegram bot
+python-telegram-bot>=20.7
+
+# Logging
+aiologger>=0.7.0
+
+# Windows/MT5 Integration (Required for Deriv MT5 automation)
+MetaTrader5>=5.0.1080; platform_system == "Windows"
+pywin32>=306; platform_system == "Windows"
+
+# Machine Learning & Strategy Optimization
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Data Persistence
+sqlite3-api>=4.0.0; platform_system != "Windows"
+# sqlite3 is built-in on Windows
+
+# Optional: Performance profiling
+# pyroscope-io>=0.35.0
+
+# Optional: Redis for state persistence
+# redis>=5.0.0
+# aiofiles>=23.0.0
