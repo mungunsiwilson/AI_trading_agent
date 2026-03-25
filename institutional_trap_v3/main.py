@@ -1,789 +1,457 @@
-#!/usr/bin/env python3
-"""
-Institutional Trap v3.0 - Main Entry Point
-
-High-performance algorithmic trading agent implementing the symmetric
-"Reaction Time" model for both long and short positions.
-
-Usage:
-    python main.py
-
-Requirements:
-    - Python 3.10+
-    - All dependencies from requirements.txt
-    - Valid .env configuration file
-"""
-
 import asyncio
-import signal
-import sys
-from typing import Optional, Dict, Any
-import logging
-
-# Try to use uvloop for better performance on Unix systems
-try:
-    import uvloop
-    if sys.platform != "win32":
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        print("✓ Using uvloop for improved performance")
-except ImportError:
-    pass
+import MetaTrader5 as mt5
+import pandas as pd
+from datetime import datetime, timedelta
 
 from config import Config
-from utils.logger import setup_logger
-from utils.helpers import format_price, format_size, calculate_position_size
-from strategy.core import StrategyCore, Direction, EntrySignal
-from execution.exchange_client import ExchangeClient
-from execution.position_manager import PositionManager, PositionAction
-from execution.mt5_client import DerivMT5Client, OrderType
-from execution.trade_database import TradeDatabase, StrategyOptimizer, TradeRecord
+from utils.logger import get_logger
+from execution.mt5_client import MT5Client
+from execution.position_manager import PositionManager
+from strategy.core import SMCEngine
+from ml.database import TradeDatabase
+from ml.learner import MLTrainer
 from notification.telegram_bot import TelegramBot
-from data.streams import (
-    TradeStream, OrderBookStream, MarkPriceStream, CandleStream,
-    create_streams
-)
-from data.buffers import CircularBuffer
 
-
-logger = logging.getLogger("institutional_trap_v3")
-
+logger = get_logger("Main")
 
 class TradingAgent:
-    """
-    Main trading agent orchestrating all components.
-    Implements async event-driven architecture.
-    """
-    
     def __init__(self):
-        """Initialize trading agent."""
-        self.config = Config()
-        self.logger = setup_logger(
-            level=self.config.LOG_LEVEL,
-            use_async=True
-        )
+        self.mt5 = MT5Client()
+        self.strategy = SMCEngine()
+        self.pos_manager = PositionManager()
+        self.db = TradeDatabase()
+        self.ml = MLTrainer(self.db, Config.ML_MODEL_PATH)
+        self.tg = TelegramBot(self)
         
-        # Validate configuration
-        errors = self.config.validate()
-        if errors:
-            for error in errors:
-                self.logger.error(f"Configuration error: {error}")
-            raise ValueError("Invalid configuration")
+        self.running = False
+        self.last_5m_check = None
         
-        # Components
-        self.exchange: Optional[ExchangeClient] = None
-        self.mt5_client: Optional[DerivMT5Client] = None  # For Deriv MT5 execution
-        self.position_manager: Optional[PositionManager] = None
-        self.telegram_bot: Optional[TelegramBot] = None
-        self.strategy: Optional[StrategyCore] = None
+        # --- DATA CACHE SYSTEM ---
+        self._cache = {'1h': None, '5m': None, '1m': None}
+        self._cache_time = {'1h': None, '5m': None, '1m': None}
+        self._cache_ttl = {
+            '1h': timedelta(minutes=5),
+            '5m': timedelta(minutes=1),
+            '1m': timedelta(seconds=30)
+        }
         
-        # Trade database and ML
-        self.trade_db: Optional[TradeDatabase] = None
-        self.ml_optimizer: Optional[StrategyOptimizer] = None
-        self._trade_count_since_retrain = 0
+        # --- ANTI-SPAM TRACKING ---
+        self._last_cooldown_log = None  # Track last cooldown log time
+        self._cooldown_log_interval = timedelta(minutes=1)  # Log every 1 minute max
+
+    def _get_cached_data(self, timeframe, mt5_tf, count, min_bars=10):
+        """Cached data fetcher with TTL."""
+        now = datetime.now()
         
-        # Data queues
-        self.trade_queue: asyncio.Queue = asyncio.Queue()
-        self.orderbook_queue: asyncio.Queue = asyncio.Queue()
-        self.mark_queue: asyncio.Queue = asyncio.Queue()
-        self.candle_queue: asyncio.Queue = asyncio.Queue()
+        # Return cached data if fresh
+        if (self._cache[timeframe] is not None and 
+            self._cache_time[timeframe] is not None):
+            age = now - self._cache_time[timeframe]
+            if age < self._cache_ttl[timeframe]:
+                return self._cache[timeframe]
         
-        # Streams
-        self.streams: Dict[str, Any] = {}
-        self._stream_tasks: list = []
-        
-        # State
-        self._running = False
-        self._symbol_info: Optional[Dict[str, Any]] = None
-        self._current_atr: float = 0.0
-        self._last_bar_delta: float = 0.0
-        self._h1_candles_loaded = False
-    
-    async def initialize(self) -> None:
-        """Initialize all components."""
-        self.logger.info("Initializing Institutional Trap v3.0...")
-        
-        # Initialize trade database first
-        self.trade_db = TradeDatabase("trades.db")
-        self.logger.info("Trade database initialized")
-        
-        # Initialize ML optimizer if enabled
-        if self.config.ML_ENABLED:
-            self.ml_optimizer = StrategyOptimizer(
-                self.trade_db, 
-                "ml_model.joblib",
-                min_trades_for_training=self.config.ML_MIN_TRADES_FOR_TRAINING
-            )
-            # Try to load existing model
-            if self.ml_optimizer.load_model():
-                self.logger.info("ML model loaded successfully")
-            else:
-                self.logger.info(f"No pre-trained ML model found (will train after {self.config.ML_MIN_TRADES_FOR_TRAINING} trades)")
-        
-        # Initialize exchange client
-        self.exchange = ExchangeClient(self.config)
-        await self.exchange.initialize()
-        
-        # Get symbol info for precision
-        self._symbol_info = await self.exchange.get_symbol_info(
-            self.config.get_symbol_for_ccxt()
-        )
-        
-        # Initialize MT5 client for Deriv execution (Windows only)
-        if self.config.TRADING_PLATFORM == "deriv" and self.config.MT5_ENABLED:
-            self.mt5_client = DerivMT5Client(self.config)
-            if await self.mt5_client.initialize():
-                self.logger.info("MT5 client initialized - Automatic execution ENABLED")
-            else:
-                self.logger.warning("MT5 initialization failed - Falling back to signal mode")
-                self.mt5_client = None
+        # Fetch fresh data
+        rates = self.mt5.get_rates(Config.SYMBOL, mt5_tf, count)
+        if rates is not None and len(rates) >= min_bars:
+            df = pd.DataFrame(rates)
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            self._cache[timeframe] = df
+            self._cache_time[timeframe] = now
+            logger.debug(f"Fetched {len(df)} {timeframe} candles (cache refreshed)")
+            return df
+        elif self._cache[timeframe] is not None:
+            logger.warning(f"Failed to fetch {timeframe}, using stale cache")
+            return self._cache[timeframe]
         else:
-            self.mt5_client = None
-        
-        # Initialize position manager
-        self.position_manager = PositionManager(self.config, self.exchange)
-        
-        # Initialize strategy
-        self.strategy = StrategyCore(self.config)
-        
-        # Initialize Telegram bot
-        self.telegram_bot = TelegramBot(self.config)
-        await self.telegram_bot.initialize()
-        
-        # Set up callbacks
-        self.telegram_bot.set_callbacks(
-            get_status=self.get_status_message,
-            get_balance=self.get_balance_message,
-            stop_trading=self.emergency_stop,
-            get_ml_analysis=self.get_ml_analysis,
-            close_position=self.close_current_position
-        )
-        
-        # Load historical data for indicators
-        await self.load_historical_data()
-        
-        self.logger.info("Initialization complete")
-    
-    async def load_historical_data(self) -> None:
-        """Load historical data to prime indicators."""
-        self.logger.info("Loading historical data...")
-        
-        try:
-            # Load 1-hour candles for VWMA
-            h1_candles = await self.exchange.fetch_ohlcv(
-                self.config.get_symbol_for_ccxt(),
-                timeframe='1h',
-                limit=self.config.VWMA_PERIOD_H1 + 10
-            )
-            
-            for candle in h1_candles:
-                timestamp, open_p, high, low, close, volume = candle
-                self.strategy.update_h1_candle(close, volume)
-            
-            self._h1_candles_loaded = True
-            
-            # Load 1-minute candles for ATR and Delta
-            m1_candles = await self.exchange.fetch_ohlcv(
-                self.config.get_symbol_for_ccxt(),
-                timeframe='1m',
-                limit=100
-            )
-            
-            # Use m1_candles for the loop (was incorrectly using h1_candles[-100:])
-            for candle in m1_candles:
-                timestamp, open_p, high, low, close, volume = candle
-                # Approximate delta as 0 for historical data
-                self.strategy.update_m1_candle(
-                    open_p, high, low, close, volume, 0, int(timestamp)
-                )
-            
-            self._current_atr = self.strategy.get_atr()
-            
-            self.logger.info(
-                f"Historical data loaded: VWMA={format_price(self.strategy._h1_vwma)}, "
-                f"ATR={format_price(self._current_atr)}"
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Error loading historical data: {e}")
-            raise
-    
-    async def start_streams(self) -> None:
-        """Start WebSocket data streams based on platform."""
-        self.logger.info("Starting data streams...")
-        
-        # Create HTTP session for streams
-        import aiohttp
-        self._session = aiohttp.ClientSession()
-        
-        # Create streams based on platform
-        if self.config.TRADING_PLATFORM == "deriv":
-            # For Deriv, use the new stream classes
-            from data.streams import DerivTickStream, DerivCandleStream
-            
-            symbol_clean = self.config.SYMBOL  # R_25 for Deriv
-            
-            self.streams['trades'] = DerivTickStream(
-                symbol_clean, 
-                self.trade_queue,
-                self.config.DERIV_APP_ID,
-                self.config.DERIV_SERVER
-            )
-            self.streams['candles_m1'] = DerivCandleStream(
-                symbol_clean, 
-                60,  # 1-minute granularity
-                self.candle_queue,
-                self.config.DERIV_APP_ID,
-                self.config.DERIV_SERVER
-            )
-            self.streams['candles_h1'] = DerivCandleStream(
-                symbol_clean, 
-                3600,  # 1-hour granularity
-                asyncio.Queue(),  # Separate queue for H1
-                self.config.DERIV_APP_ID,
-                self.config.DERIV_SERVER
-            )
-            
-            self.logger.info(f"Started Deriv streams for {symbol_clean}")
+            logger.error(f"Failed to fetch {timeframe} and no cache available")
+            return None
+
+    def _should_log_cooldown(self):
+        """Anti-spam: Check if we should log cooldown message"""
+        now = datetime.now()
+        if self._last_cooldown_log is None:
+            self._last_cooldown_log = now
+            return True
+        if now - self._last_cooldown_log >= self._cooldown_log_interval:
+            self._last_cooldown_log = now
+            return True
+        return False
+
+    def _invalidate_cache(self, timeframe=None):
+        """Invalidate cache for specific timeframe or all"""
+        if timeframe:
+            self._cache[timeframe] = None
+            self._cache_time[timeframe] = None
         else:
-            # For Binance
-            symbol_clean = self.config.SYMBOL.replace("/", "").replace(":USDT", "")
-            
-            self.streams['trades'] = TradeStream(symbol_clean, self.trade_queue)
-            self.streams['orderbook'] = OrderBookStream(symbol_clean, self.orderbook_queue)
-            self.streams['mark_price'] = MarkPriceStream(symbol_clean, self.mark_queue)
-            self.streams['candles_m1'] = CandleStream(symbol_clean, '1m', self.candle_queue)
-            self.streams['candles_h1'] = CandleStream(symbol_clean, '1h', self.candle_queue)
-            
-            self.logger.info(f"Started Binance streams for {symbol_clean}")
+            for tf in self._cache:
+                self._cache[tf] = None
+                self._cache_time[tf] = None
+
+    async def start(self):
+        logger.info("Initializing SMC Agent (Strict 60m Lock)...")
         
-        # Start stream tasks
-        for name, stream in self.streams.items():
-            task = asyncio.create_task(stream.start(self._session))
-            self._stream_tasks.append(task)
-            self.logger.info(f"Started {name} stream")
-    
-    async def process_events(self) -> None:
-        """Main event processing loop."""
-        self.logger.info("Starting event processing loop...")
-        
-        while self._running:
-            try:
-                # Process queues with timeout
-                await self.process_queues(timeout=0.1)
-                
-                # Check for entry signals (only if no position)
-                if not self.position_manager.has_position() and self.strategy.is_ready():
-                    signal = self.strategy.should_enter()
-                    if signal:
-                        await self.execute_entry(signal)
-                
-                # Update position management
-                if self.position_manager.has_position():
-                    await self.manage_position()
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Error in event loop: {e}", exc_info=True)
-                await asyncio.sleep(1)
-    
-    async def process_queues(self, timeout: float = 0.1) -> None:
-        """Process data from all queues."""
-        try:
-            # Process trade queue
-            while not self.trade_queue.empty():
-                trade = await asyncio.wait_for(self.trade_queue.get(), timeout=0.01)
-                self.handle_trade(trade)
-        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-            pass
-        
-        try:
-            # Process orderbook queue
-            while not self.orderbook_queue.empty():
-                orderbook = await asyncio.wait_for(self.orderbook_queue.get(), timeout=0.01)
-                self.handle_orderbook(orderbook)
-        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-            pass
-        
-        try:
-            # Process mark price queue
-            while not self.mark_queue.empty():
-                mark = await asyncio.wait_for(self.mark_queue.get(), timeout=0.01)
-                self.handle_mark_price(mark)
-        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-            pass
-        
-        try:
-            # Process candle queue
-            while not self.candle_queue.empty():
-                candle = await asyncio.wait_for(self.candle_queue.get(), timeout=0.01)
-                await self.handle_candle(candle)
-        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-            pass
-    
-    def handle_trade(self, trade: Dict[str, Any]) -> None:
-        """Handle incoming trade."""
-        if trade.get('type') != 'trade':
+        if not self.mt5.connect():
+            logger.error("MT5 Connection Failed")
+            await self.tg.send_message("🛑 **CRITICAL ERROR**: Failed to connect to MT5.")
             return
+            
+        self.db.init_db()
+        if Config.ML_ENABLED:
+            self.ml.load_model()
+            count = self.db.get_trade_count()
+            logger.info(f"ML Status: {count}/{Config.ML_MIN_TRADES} trades collected")
+            
+        await self.tg.start()
         
-        self.strategy.add_trade(
-            price=trade['price'],
-            size=trade['size'],
-            side=trade['side'],
-            timestamp=trade['timestamp']
-        )
-    
-    def handle_orderbook(self, orderbook: Dict[str, Any]) -> None:
-        """Handle order book update."""
-        if orderbook.get('type') != 'orderbook':
-            return
-        
-        self.strategy.update_orderbook(
-            bids=orderbook['bids'],
-            asks=orderbook['asks']
-        )
-    
-    def handle_mark_price(self, mark: Dict[str, Any]) -> None:
-        """Handle mark price update."""
-        if mark.get('type') != 'mark_price':
-            return
-        
-        self.strategy.update_mark_price(mark['price'])
-    
-    async def handle_candle(self, candle: Dict[str, Any]) -> None:
-        """Handle candle update."""
-        if candle.get('type') != 'candle':
-            return
-        
-        timeframe = candle.get('timeframe')
-        
-        if not candle.get('closed', False):
-            return  # Only process closed candles
-        
-        if timeframe == '1h':
-            # Update VWMA
-            self.strategy.update_h1_candle(
-                close=candle['close'],
-                volume=candle['volume']
-            )
-        
-        elif timeframe == '1m':
-            # Finalize previous bar delta
-            self._last_bar_delta = self.strategy.finalize_bar()
-            
-            # Update M1 bar data
-            self.strategy.update_m1_candle(
-                open_price=candle['open'],
-                high=candle['high'],
-                low=candle['low'],
-                close=candle['close'],
-                volume=candle['volume'],
-                delta=self._last_bar_delta,
-                timestamp=candle['timestamp']
-            )
-            
-            # Update ATR
-            self._current_atr = self.strategy.get_atr()
-    
-    async def execute_entry(self, signal: EntrySignal) -> None:
-        """Execute entry order."""
-        try:
-            # Calculate position size
-            contracts = calculate_position_size(
-                self.config.POSITION_SIZE_USD,
-                signal.entry_price
-            )
-            
-            # Normalize to exchange precision
-            if self._symbol_info:
-                step_size = self._symbol_info.get('precision', {}).get('amount', 0.001)
-                contracts = round(contracts / step_size) * step_size
-            
-            # Check ML recommendation if enabled
-            should_take = True
-            ml_probability = 0.5
-            if self.ml_optimizer and self.config.ML_ENABLED:
-                features = {
-                    'vwma_1h': self.strategy._h1_vwma,
-                    'atr_1m': self._current_atr,
-                    'delta_spike': signal.delta_spike,
-                    'absorption_bars': signal.absorption_bars,
-                    'tick_speed_drop': signal.tick_speed_drop,
-                    'orderbook_depth_change': signal.depth_change,
-                    'direction': 'BUY' if signal.direction == Direction.LONG else 'SELL'
-                }
-                should_take, ml_probability = self.ml_optimizer.should_take_trade(
-                    features, 
-                    min_probability=self.config.ML_MIN_PROBABILITY_THRESHOLD
-                )
-                
-                if not should_take:
-                    self.logger.info(f"ML advised skipping trade (probability: {ml_probability:.2%})")
-                    await self.telegram_bot.send_message(
-                        f"⚠️ Trade SKIPPED by ML\n\n"
-                        f"Direction: {signal.direction.name}\n"
-                        f"Probability: {ml_probability:.2%}\n"
-                        f"Threshold: {self.config.ML_MIN_PROBABILITY_THRESHOLD:.2%}"
-                    )
-                    return
-            
-            side = 'buy' if signal.direction == Direction.LONG else 'sell'
-            direction_int = 1 if signal.direction == Direction.LONG else -1
-            
-            # Execute via MT5 for Deriv, or CCXT for Binance
-            if self.mt5_client and self.config.TRADING_PLATFORM == "deriv":
-                # MT5 execution
-                mt5_direction = OrderType.BUY if signal.direction == Direction.LONG else OrderType.SELL
-                result = await self.mt5_client.execute_market_order(mt5_direction, contracts)
-                
-                if not result.success:
-                    raise Exception(f"MT5 order failed: {result.message}")
-                
-                ticket = result.ticket
-                entry_price = result.price
-                self.logger.info(f"MT5 order executed: Ticket {ticket}, Price {entry_price}")
-            else:
-                # CCXT execution (Binance or fallback)
-                self.logger.info(
-                    f"Placing {side} order: {contracts} contracts @ {signal.entry_price}"
-                )
-                
-                order = await self.exchange.create_market_order(
-                    self.config.get_symbol_for_ccxt(),
-                    side,
-                    contracts
-                )
-                
-                ticket = order.get('id', 0)
-                entry_price = signal.entry_price
-            
-            # Open position in manager
-            self.position_manager.open_position(
-                direction=direction_int,
-                entry_price=entry_price,
-                contracts=contracts,
-                atr=self._current_atr
-            )
-            
-            # Store entry context for later trade recording
-            self._pending_trade = {
-                'ticket': ticket,
-                'symbol': self.config.SYMBOL,
-                'direction': 'BUY' if signal.direction == Direction.LONG else 'SELL',
-                'entry_price': entry_price,
-                'volume': contracts,
-                'entry_time': asyncio.get_event_loop().time(),
-                'stop_loss': self.position_manager.get_current_stop(),
-                'vwma_1h': self.strategy._h1_vwma,
-                'atr_1m': self._current_atr,
-                'delta_spike': signal.delta_spike,
-                'absorption_bars': signal.absorption_bars,
-                'tick_speed_drop': signal.tick_speed_drop,
-                'orderbook_depth_change': signal.depth_change,
-                'ml_probability': ml_probability
-            }
-            
-            # Send notification
-            msg = (
-                f"✅ <b>ENTRY EXECUTED</b>\n\n"
-                f"Direction: {signal.direction.name}\n"
-                f"Price: {entry_price:.4f}\n"
-                f"Size: {contracts}\n"
-                f"Stop Loss: {self.position_manager.get_current_stop():.4f}\n"
-                f"ATR: {self._current_atr:.4f}\n"
-                f"ML Probability: {ml_probability:.2%}\n"
-                f"Ticket: {ticket}"
-            )
-            await self.telegram_bot.send_message(msg)
-            
-            self.logger.info(f"Entry executed: {signal.direction.name} @ {entry_price}, Ticket: {ticket}")
-            
-        except Exception as e:
-            self.logger.error(f"Entry execution failed: {e}", exc_info=True)
-            await self.telegram_bot.send_error_notification(f"Entry failed: {e}")
-    
-    async def manage_position(self) -> None:
-        """Manage active position."""
-        current_price = self.strategy._current_mark_price
-        
-        if current_price <= 0:
-            return
-        
-        # Check stop loss hit
-        if self.position_manager.check_stop_loss(current_price):
-            await self.exit_position("Stop Loss Hit")
-            return
-        
-        # Update trailing stop
-        action, new_stop = self.position_manager.update(
-            current_price=current_price,
-            current_delta=self._last_bar_delta
+        await self.tg.send_message(
+            f"✅ **Bot Started Successfully**\n"
+            f"Symbol: `{Config.SYMBOL}`\n"
+            f"Strategy: SMC Liquidity Sweep\n"
+            f"Time: {datetime.now().strftime('%H:%M:%S')}\n"
+            f"Status: _Scanning for setups..._"
         )
         
-        if action == PositionAction.EXIT:
-            await self.exit_position("Time Limit Reached")
-        elif action == PositionAction.UPDATE_STOP:
-            self.logger.debug(f"Stop updated to {new_stop:.2f}")
-    
-    async def exit_position(self, reason: str) -> None:
-        """Exit current position."""
-        try:
-            pos_info = self.position_manager.get_position_info()
-            if not pos_info:
-                return
-            
-            entry_price = pos_info['entry_price']
-            direction = pos_info['direction']
-            
-            # Close via exchange/MT5
-            if self.mt5_client and self.config.TRADING_PLATFORM == "deriv":
-                # Get MT5 position ticket
-                mt5_positions = await self.mt5_client.get_open_positions()
-                if mt5_positions:
-                    # Close the most recent position for our symbol
-                    for pos in mt5_positions:
-                        if pos.symbol == self.config.SYMBOL:
-                            result = await self.mt5_client.close_position(pos.ticket)
-                            if result.success:
-                                self.logger.info(f"MT5 position closed: Ticket {pos.ticket}")
-                            break
-            else:
-                result = await self.position_manager.close_position()
-            
-            # Calculate PnL
-            current_price = self.strategy._current_mark_price
-            pnl = self.position_manager.get_unrealized_pnl(current_price)
-            
-            # Record trade in database
-            if hasattr(self, '_pending_trade') and self._pending_trade:
-                from datetime import datetime
-                trade_record = TradeRecord(
-                    ticket=self._pending_trade['ticket'],
-                    symbol=self._pending_trade['symbol'],
-                    direction=self._pending_trade['direction'],
-                    entry_price=self._pending_trade['entry_price'],
-                    exit_price=current_price,
-                    volume=self._pending_trade['volume'],
-                    entry_time=datetime.fromtimestamp(self._pending_trade['entry_time']),
-                    exit_time=datetime.now(),
-                    pnl=pnl,
-                    pnl_percent=(pnl / self.config.POSITION_SIZE_USD) * 100,
-                    stop_loss=self._pending_trade['stop_loss'],
-                    take_profit=0.0,  # Not used in trailing stop strategy
-                    exit_reason=reason,
-                    vwma_1h=self._pending_trade['vwma_1h'],
-                    atr_1m=self._pending_trade['atr_1m'],
-                    delta_spike=self._pending_trade['delta_spike'],
-                    absorption_bars=self._pending_trade['absorption_bars'],
-                    tick_speed_drop=self._pending_trade['tick_speed_drop'],
-                    orderbook_depth_change=self._pending_trade['orderbook_depth_change']
-                )
-                self.trade_db.save_trade(trade_record)
-                
-                # Increment trade counter for ML retraining
-                self._trade_count_since_retrain += 1
-                
-                # Auto-retrain ML model if enough trades accumulated
-                if (self.ml_optimizer and self.config.ML_AUTO_RETRAIN and 
-                    self._trade_count_since_retrain >= self.config.ML_RETRAIN_EVERY_N_TRADES):
-                    self.logger.info(f"Auto-retraining ML model after {self._trade_count_since_retrain} trades...")
-                    if self.ml_optimizer.train_model():
-                        self._trade_count_since_retrain = 0
-                        await self.telegram_bot.send_message("🧠 ML model retrained successfully!")
-                
-                # Clear pending trade
-                self._pending_trade = None
-            
-            # Send notification
-            msg = (
-                f"🚪 <b>POSITION CLOSED</b>\n\n"
-                f"Direction: {direction}\n"
-                f"Entry: {entry_price:.4f}\n"
-                f"Exit: {current_price:.4f}\n"
-                f"PnL: ${pnl:.2f} ({pnl/self.config.POSITION_SIZE_USD*100:+.2f}%)\n"
-                f"Reason: {reason}"
-            )
-            await self.telegram_bot.send_message(msg)
-            
-            self.logger.info(f"Position exited: {reason}, PnL: {pnl:.2f} USDT")
-            
-        except Exception as e:
-            self.logger.error(f"Exit failed: {e}", exc_info=True)
-            await self.telegram_bot.send_error_notification(f"Exit failed: {e}")
-    
-    async def get_ml_analysis(self) -> str:
-        """Get ML analysis and performance stats for Telegram"""
-        if not self.ml_optimizer or not self.config.ML_ENABLED:
-            return "ML is disabled"
-        
-        # Get performance stats
-        stats = self.trade_db.get_performance_stats()
-        
-        if stats['total_trades'] == 0:
-            return "📊 No trades recorded yet"
-        
-        # Get optimal parameters
-        optimal = self.ml_optimizer.get_optimal_parameters()
-        
-        msg = (
-            f"🧠 <b>ML Analysis Report</b>\n\n"
-            f"Total Trades: {stats['total_trades']}\n"
-            f"Wins: {stats['wins']} ({stats['win_rate']:.1f}%)\n"
-            f"Losses: {stats['losses']}\n"
-            f"Total PnL: ${stats['total_pnl']:.2f}\n"
-            f"Avg Win: ${stats['avg_win']:.2f}\n"
-            f"Avg Loss: ${stats['avg_loss']:.2f}\n"
-            f"Profit Factor: {stats['profit_factor']:.2f}\n"
-        )
-        
-        if optimal:
-            msg += (
-                f"\n<b>Optimal Parameters:</b>\n"
-                f"Delta Spike: {optimal.get('optimal_delta_spike', 'N/A'):.2f}\n"
-                f"Absorption Bars: {optimal.get('optimal_absorption_bars', 'N/A'):.1f}\n"
-                f"Tick Speed Drop: {optimal.get('optimal_tick_speed_drop', 'N/A'):.1%}\n"
-            )
-        
-        return msg
-    
-    async def emergency_stop(self) -> None:
-        """Emergency stop - close all positions and halt trading."""
-        self.logger.warning("EMERGENCY STOP INITIATED")
-        
-        if self.position_manager.has_position():
-            await self.exit_position("Emergency Stop")
-        
-        self._running = False
-    
-    async def close_current_position(self) -> str:
-        """Close current position manually via Telegram command."""
-        if not self.position_manager.has_position():
-            return "📊 No open positions to close"
+        self.running = True
+        logger.info(f"Monitoring {Config.SYMBOL}...")
         
         try:
-            pos = self.position_manager.get_position_info()
-            await self.exit_position("Manual Close (Telegram)")
-            
-            return (
-                f"✅ Position Closed Manually\n\n"
-                f"Direction: {pos['direction']}\n"
-                f"Entry: {pos['entry_price']:.2f}\n"
-                f"Exit: {self.strategy._current_mark_price:.2f}"
-            )
-        except Exception as e:
-            self.logger.error(f"Error closing position manually: {e}")
-            return f"❌ Error closing position: {e}"
-    
-    async def get_status_message(self) -> str:
-        """Get formatted status message for Telegram."""
-        if not self.position_manager.has_position():
-            return "📊 No open positions"
-        
-        pos = self.position_manager.get_position_info()
-        current_price = self.strategy._current_mark_price
-        pnl = self.position_manager.get_unrealized_pnl(current_price)
-        pnl_sign = "+" if pnl >= 0 else ""
-        
-        elapsed_min = (int(asyncio.get_event_loop().time()) - pos['entry_time']) // 60
-        
-        return (
-            f"📊 <b>Position Status</b>\n\n"
-            f"Direction: {pos['direction']}\n"
-            f"Entry: {pos['entry_price']:.2f}\n"
-            f"Current: {current_price:.2f}\n"
-            f"Stop: {pos['current_stop']:.2f}\n"
-            f"PnL: {pnl_sign}{pnl:.2f} USDT\n"
-            f"Duration: {elapsed_min} min"
-        )
-    
-    async def get_balance_message(self) -> str:
-        """Get formatted balance message for Telegram."""
-        try:
-            balance = await self.exchange.fetch_balance()
-            total = balance.get('total', {})
-            usdt = total.get('USDT', 0)
-            
-            return (
-                f"💰 <b>Account Balance</b>\n\n"
-                f"USDT: {usdt:.2f}"
-            )
-        except Exception as e:
-            return f"Error fetching balance: {e}"
-    
-    async def run(self) -> None:
-        """Run the trading agent."""
-        try:
-            self._running = True
-            
-            # Start Telegram bot
-            await self.telegram_bot.start()
-            
-            # Start data streams
-            await self.start_streams()
-            
-            # Give streams time to connect
-            await asyncio.sleep(5)
-            
-            # Start main event loop
-            await self.process_events()
-            
-        except Exception as e:
-            self.logger.error(f"Fatal error: {e}", exc_info=True)
-            await self.telegram_bot.send_error_notification(f"Fatal error: {e}")
+            while self.running:
+                await self.loop()
+                await asyncio.sleep(0.5)
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            await self.tg.send_message("🛑 Bot stopped by user.")
         finally:
-            await self.shutdown()
-    
-    async def shutdown(self) -> None:
-        """Graceful shutdown."""
-        self.logger.info("Shutting down...")
-        self._running = False
-        
-        # Close position if open
-        if self.position_manager and self.position_manager.has_position():
-            self.logger.info("Closing open position...")
-            await self.position_manager.close_position()
-        
-        # Stop streams
-        for task in self._stream_tasks:
-            task.cancel()
-        
-        # Close session
-        if hasattr(self, '_session'):
-            await self._session.close()
-        
-        # Close exchange
-        if self.exchange:
-            await self.exchange.close()
-        
-        # Stop Telegram bot
-        if self.telegram_bot:
-            await self.telegram_bot.stop()
-        
-        self.logger.info("Shutdown complete")
+            self.shutdown()
 
+    async def execute_trade(self, signal):
+        """Executes the trade with robust error handling"""
+        direction = signal['direction']
+        entry_price = signal['entry_price']
+        sl_price = signal['stop_loss']
+        
+        logger.info(f"Attempting to execute {direction} trade...")
 
-async def main():
-    """Main entry point."""
-    agent: Optional[TradingAgent] = None
-    
-    def signal_handler(sig, frame):
-        """Handle shutdown signals."""
-        print("\nShutdown signal received...")
-        if agent:
-            asyncio.create_task(agent.shutdown())
-    
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        agent = TradingAgent()
-        await agent.initialize()
-        await agent.run()
-    except Exception as e:
-        print(f"Fatal error: {e}")
-        sys.exit(1)
+        if Config.ML_ENABLED and self.ml.model:
+            features = signal.get('features', {})
+            if features:
+                prob = self.ml.predict(signal, getattr(self, 'df_1m', None)) 
+                if prob < Config.ML_THRESHOLD:
+                    logger.info(f"❌ Trade FILTERED by ML (Prob: {prob:.2f})")
+                    return False
 
+        order_type = mt5.ORDER_TYPE_BUY if direction == 'LONG' else mt5.ORDER_TYPE_SELL
+        
+        request = self.mt5.build_order(
+            symbol=Config.SYMBOL,
+            type=order_type,
+            volume=Config.LOT_SIZE,
+            sl=sl_price,
+            tp=0.0
+        )
+        
+        if not request:
+            logger.error("Failed to build order request.")
+            await self.tg.send_message("❌ Order Build Failed")
+            return False
+
+        result = self.mt5.execute_order(request)
+
+        if result is None:
+            err = mt5.last_error()
+            logger.error(f"Order execution returned None. Last Error: {err}")
+            await self.tg.send_message(f"⚠️ **Execution Error**: {err}")
+            return False
+        
+        retcode = result.retcode
+        deal_id = result.deal
+
+        logger.info(f"MT5 Order Send Raw Result: {result}")
+        
+        if retcode == mt5.TRADE_RETCODE_DONE or retcode == 10009:
+            logger.info(f"✅ TRADE EXECUTED: {direction} @ {entry_price} | Deal ID: {deal_id}")
+            
+            risk_points = abs(entry_price - sl_price)
+            
+            self.pos_manager.init_position(
+                direction=direction,
+                entry_price=entry_price,
+                sl=sl_price,
+                risk_step=risk_points,
+                entry_time=datetime.now()
+            )
+            self.strategy.state = 'IDLE'
+            self._invalidate_cache('1m')
+            
+            await self.tg.send_entry_alert(direction, entry_price, sl_price, 0.0, signal.get('pattern', 'SMC'))
+            return True
+            
+        else:
+            comment = result.get('comment', 'Unknown')
+            logger.error(f"❌ Order Failed: Retcode={retcode}, Comment={comment}")
+            await self.tg.send_message(f"❌ **Order Failed**\nCode: `{retcode}`\nMsg: {comment}")
+            return False
+
+    async def loop(self):
+        """Main Loop with Strict State & Time Logic"""
+        try:
+            now = datetime.now()
+            
+            df_1m = None
+            df_5m = None
+            df_1h = None
+
+            # --- STATE: IDLE ---
+            if self.strategy.state == 'IDLE':
+                df_1h = self._get_cached_data('1h', mt5.TIMEFRAME_H1, 250, min_bars=200)
+                df_5m = self._get_cached_data('5m', mt5.TIMEFRAME_M5, 20, min_bars=5)
+                
+            # --- STATE: INVALIDATED (Cooldown) ---
+            elif self.strategy.state == 'INVALIDATED':
+                if self.strategy.last_fetch_time:
+                    elapsed = now - self.strategy.last_fetch_time
+                    elapsed_minutes = elapsed.total_seconds() / 60.0
+                    
+                    if elapsed_minutes >= 60:
+                        # Cooldown expired - fetch new data
+                        logger.info("Cooldown expired. Fetching new 1H levels...")
+                        df_1h = self._get_cached_data('1h', mt5.TIMEFRAME_H1, 250, min_bars=200)
+                        # Don't return here - let it fall through to process the new range
+                    else:
+                        # Still in cooldown - manage position and return
+                        remaining = 60 - elapsed_minutes
+                        
+                        # ANTI-SPAM: Only log every minute instead of every tick
+                        if self._should_log_cooldown():
+                            logger.info(f"Setup Invalidated. Cooldown: {remaining:.1f}m remaining.")
+                        
+                        await self.manage_position()
+                        return  # Early return - don't process further
+                else:
+                    # No last_fetch_time - fetch as fallback
+                    logger.warning("Invalidated state but no last_fetch_time. Fetching fallback...")
+                    df_1h = self._get_cached_data('1h', mt5.TIMEFRAME_H1, 250, min_bars=200)
+
+            # --- STATE: SWEEP_DETECTED ---
+            elif self.strategy.state == 'SWEEP_DETECTED':
+                await asyncio.sleep(60)  # Wait for 1M candle close
+                df_1m = self._get_cached_data('1m', mt5.TIMEFRAME_M1, 10, min_bars=3)
+                df_1h = self._get_cached_data('1h', mt5.TIMEFRAME_H1, 250, min_bars=200)
+
+            # --- STATE MACHINE EXECUTION ---
+            
+            # IDLE: Establish range or look for sweeps
+            if self.strategy.state == 'IDLE':
+                # Try to establish range
+                if df_1h is not None and self.strategy.range_high is None:
+                    if self.strategy.analyze_1h_range(df_1h):
+                        logger.info("Initial 1H Range Established.")
+                
+                # Look for sweeps
+                if self.strategy.range_high is not None and df_5m is not None:
+                    if df_1h is None:
+                        logger.error("CRITICAL: df_1h is None in IDLE state, emergency fetching...")
+                        df_1h = self._get_cached_data('1h', mt5.TIMEFRAME_H1, 250, min_bars=200)
+                    
+                    sweep_result = self.strategy.analyze_5m_sweep(
+                        df_5m, 
+                        self.strategy.range_high, 
+                        self.strategy.range_low, 
+                        self.strategy.range_start_time,
+                        df_1h
+                    )
+                    
+                    if sweep_result:
+                        if sweep_result['type'] == 'SWEEP':
+                            logger.info(f"✅ Sweep Confirmed! Dir: {sweep_result['direction']}")
+                            self.strategy.state = 'SWEEP_DETECTED'
+                            self.strategy.sweep_direction = sweep_result['direction']
+                            self.strategy.order_block_high = sweep_result['ob_high']
+                            self.strategy.order_block_low = sweep_result['ob_low']
+                            self.strategy.sweep_wick_extreme = sweep_result.get('sweep_wick_extreme', 
+                                sweep_result['ob_high'] if sweep_result['direction'] == 'SHORT' else sweep_result['ob_low'])
+                            self.strategy.entry_count = 0
+                            self.strategy.last_entry_time = None
+                        elif sweep_result['type'] == 'INVALIDATE':
+                            logger.warning("Range broken without valid sweep. Invalidating.")
+                            self.strategy.invalidate_setup()
+
+            # SWEEP_DETECTED: Look for entry
+            elif self.strategy.state == 'SWEEP_DETECTED':
+                if df_1m is not None:
+                    entry_result = self.strategy.analyze_1m_entry(
+                        df_1m, 
+                        self.strategy.order_block_high, 
+                        self.strategy.order_block_low, 
+                        self.strategy.sweep_direction,
+                        self.strategy.sweep_wick_extreme,
+                        self.strategy.range_high,
+                        self.strategy.range_low,
+                        df_1h
+                    )
+
+                    if entry_result:
+                        if entry_result['type'] == 'ENTRY':
+                            logger.info(f"🚀 ENTRY SIGNAL: {entry_result['direction']}")
+                            success = await self.execute_trade(entry_result)
+                            
+                            if success:
+                                self.strategy.entry_count += 1
+                                self.strategy.last_entry_time = datetime.now()  
+
+                                logger.info(f"Trade #{self.strategy.entry_count} executed.")
+                                
+                                if self.strategy.entry_count >= self.strategy.MAX_ENTRIES:
+                                    logger.info("Max entries reached. Resetting to IDLE.")
+                                    self.strategy.state = 'IDLE'
+                                    self.pos_manager.set_last_exit()
+                            else:
+                                logger.warning("Trade execution failed. Staying in SWEEP_DETECTED.")
+                            
+                        elif entry_result['type'] == 'INVALIDATE':
+                            logger.warning("Entry confirmation failed. Invalidating setup.")
+                            self.strategy.invalidate_setup()
+
+            # INVALIDATED: Try to establish new range if we have data
+            if self.strategy.state == 'INVALIDATED' and df_1h is not None:
+                if self.strategy.analyze_1h_range(df_1h):
+                    logger.info("Cooldown over. New Range Set. Resuming IDLE.")
+                    # Reset anti-spam tracker when transitioning out of cooldown
+                    self._last_cooldown_log = None
+
+            # Always manage positions
+            await self.manage_position()
+
+        except Exception as e:
+            logger.error(f"Loop error: {e}", exc_info=True)
+            await asyncio.sleep(1)
+
+    async def manage_position(self):
+        """Manages open positions: Trailing Stop updates"""
+        position = self.mt5.get_position(Config.SYMBOL)
+        
+        if not position:
+            if self.pos_manager.active_position:
+                logger.info("Position closed externally or by SL/TP. Clearing local state.")
+                self.pos_manager.clear_position()
+                await self.tg.send_message("⚠️ Position closed (SL/TP or external).")  
+            return
+
+        tick = self.mt5.get_tick(Config.SYMBOL)
+        if not tick:
+            return
+
+        current_price = tick.ask if position.type == 0 else tick.bid
+        
+        action = self.pos_manager.update(position, tick, Config.SYMBOL)
+        
+        if action == 'CLOSE':
+            reason = getattr(self.pos_manager, 'close_reason', "Stop Loss / Trail Hit")
+            logger.info(f"Closing position: {reason}")
+            await self.close_position(reason=reason)
+            return
+
+        if self.pos_manager.active_position:
+            current_sl = position.sl
+            calculated_sl = self.pos_manager.active_position['current_sl']
+            state = self.pos_manager.active_position
+            
+            direction = "LONG" if position.type == 0 else "SHORT"
+            entry_price = state['entry_price']
+            
+            threshold = 0.0001 * current_price 
+
+            should_update = False
+            
+            if position.type == 0:  # LONG
+                if calculated_sl > current_sl + threshold:
+                    should_update = True
+            elif position.type == 1:  # SHORT
+                if calculated_sl < current_sl - threshold:
+                    should_update = True
+
+            if should_update:
+                await self.send_modify_order(
+                    ticket=position.ticket, 
+                    new_sl=calculated_sl, 
+                    new_tp=0.0,
+                    direction=direction,
+                    entry_price=entry_price,
+                    current_price=current_price
+                )
+
+    async def send_modify_order(self, ticket, new_sl, new_tp, direction, entry_price, current_price):
+        """Sends modify order to MT5"""
+        req = self.mt5.build_modify_order(ticket, new_sl, tp=new_tp)
+        if not req:
+            logger.error("Failed to build modify order request")
+            return
+
+        result = self.mt5.execute_order(req)
+
+        if result is None:
+            logger.error(f"Modify order returned None. Last Error: {mt5.last_error()}")
+            return
+                
+        if result.retcode == mt5.TRADE_RETCODE_DONE or result.retcode == 10009:
+            if direction == 'LONG':
+                profit_pts = new_sl - entry_price
+            else:
+                profit_pts = entry_price - new_sl
+                
+            logger.info(f"✅ Trailing Stop Updated: New SL = {new_sl} | Locked = {profit_pts:.2f}")
+            await self.tg.send_trail_alert(direction, new_sl, current_price, profit_pts)
+        else:
+            err_msg = result.comment
+            logger.error(f"❌ Failed to update SL: {err_msg}")
+
+    async def close_position(self, reason="Manual"):
+        """Close open position"""
+        position = self.mt5.get_position(Config.SYMBOL)
+        if not position:
+            return
+            
+        order_type = mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY
+        
+        tick = mt5.symbol_info_tick(Config.SYMBOL)
+        price = tick.bid if position.type == 0 else tick.ask
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": Config.SYMBOL,
+            "volume": position.volume,
+            "type": order_type,
+            "position": position.ticket,
+            "price": price,
+            "deviation": 10,
+            "magic": 234000,
+            "comment": f"Close: {reason}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = self.mt5.execute_order(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"Position closed: {reason}")
+            self.pos_manager.clear_position()
+            await self.tg.send_message(f"🔒 Position Closed: {reason}")
+        else:
+            logger.error(f"Failed to close position: {getattr(result, 'comment', 'Unknown')}")
+
+    def shutdown(self):
+        logger.info("Shutting down agent...")
+        self.running = False
+        self.mt5.shutdown()
+        self.db.close()
+        
+        if self.tg.app:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.tg.stop())
+            else:
+                loop.run_until_complete(self.tg.stop())
+        logger.info("Agent stopped.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    agent = TradingAgent()
+    asyncio.run(agent.start())

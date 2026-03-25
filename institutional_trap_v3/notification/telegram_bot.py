@@ -1,307 +1,115 @@
-"""
-Async Telegram bot for notifications and command handling.
-Uses python-telegram-bot v20+ with async application.
-"""
-
 import asyncio
-from typing import Optional, Dict, Any
-import logging
-
-try:
-    from telegram import Update, Bot
-    from telegram.ext import Application, CommandHandler, ContextTypes
-    TELEGRAM_AVAILABLE = True
-    ContextTypes_DEFAULT_TYPE = ContextTypes.DEFAULT_TYPE
-except ImportError:
-    TELEGRAM_AVAILABLE = False
-    # Create dummy types for when telegram is not available
-    class Update: pass
-    class Bot: pass
-    class Application: pass
-    class CommandHandler: pass
-    class ContextTypes: 
-        DEFAULT_TYPE = None
-    ContextTypes_DEFAULT_TYPE = None
-
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from config import Config
+from utils.logger import get_logger
 
-
-logger = logging.getLogger("institutional_trap_v3")
-
+logger = get_logger("Telegram")
 
 class TelegramBot:
-    """
-    Async Telegram bot for trading notifications.
-    Supports commands: /start, /stop, /status, /balance, /help
-    """
-    
-    def __init__(self, config: Config):
-        """
-        Initialize Telegram bot.
+    def __init__(self, agent):
+        self.agent = agent
+        self.app = None
+        if not Config.TG_TOKEN: return
         
-        Args:
-            config: Configuration object
-        """
-        self.config = config
-        self.application: Optional[Application] = None
-        self._running = False
-        
-        # State callbacks (set by main app)
-        self._get_status_callback = None
-        self._get_balance_callback = None
-        self._stop_callback = None
-    
-    async def initialize(self) -> None:
-        """Initialize the bot application."""
-        if not TELEGRAM_AVAILABLE:
-            logger.warning("python-telegram-bot not available, notifications disabled")
-            return
-        
-        if not self.config.TELEGRAM_BOT_TOKEN:
-            logger.warning("Telegram bot token not configured, notifications disabled")
-            return
-        
+        self.app = Application.builder().token(Config.TG_TOKEN).build()
+        self.app.add_handler(CommandHandler("start", self.cmd_start))
+        self.app.add_handler(CommandHandler("status", self.cmd_status))
+        self.app.add_handler(CommandHandler("close", self.cmd_close))
+        self.app.add_handler(CommandHandler("ml", self.cmd_ml))
+        self.app.add_handler(CommandHandler("stop", self.cmd_stop))
+
+    async def start(self):
+        if not self.app: return
+        await self.app.initialize()
+        await self.app.start()
+        if self.app.updater:
+            await self.app.updater.start_polling()
+        logger.info("Telegram Bot Started")
+
+    async def stop(self):
+        if not self.app: return
+        if self.app.updater: await self.app.updater.stop()
+        await self.app.stop()
+        await self.app.shutdown()
+
+    async def send_message(self, text):
+        if not self.app or not Config.TG_CHAT_ID: return
         try:
-            # Build application
-            self.application = Application.builder().token(
-                self.config.TELEGRAM_BOT_TOKEN
-            ).build()
-            
-            # Add command handlers
-            self.application.add_handler(CommandHandler("start", self.cmd_start))
-            self.application.add_handler(CommandHandler("stop", self.cmd_stop))
-            self.application.add_handler(CommandHandler("close", self.cmd_close))
-            self.application.add_handler(CommandHandler("status", self.cmd_status))
-            self.application.add_handler(CommandHandler("balance", self.cmd_balance))
-            self.application.add_handler(CommandHandler("help", self.cmd_help))
-            
-            logger.info("Telegram bot initialized")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Telegram bot: {e}")
-    
-    async def start(self) -> None:
-        """Start the bot polling."""
-        if not TELEGRAM_AVAILABLE or not self.application:
-            return
-        
-        self._running = True
-        
-        # Start polling in background
-        await self.application.initialize()
-        await self.application.start()
-        
-        # Run updater with polling
-        if self.application.updater:
-            await self.application.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
-        
-        logger.info("Telegram bot started polling")
-    
-    async def stop(self) -> None:
-        """Stop the bot."""
-        self._running = False
-        
-        if self.application:
-            if self.application.updater:
-                await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
-        
-        logger.info("Telegram bot stopped")
-    
-    async def cmd_start(self, update: Update, context: ContextTypes_DEFAULT_TYPE) -> None:
-        """Handle /start command."""
-        await update.message.reply_text(
-            "🤖 Institutional Trap v3.0 Bot Started\n\n"
-            "Commands:\n"
-            "/status - Show current position and PnL\n"
-            "/close - Close current position manually\n"
-            "/balance - Show account balance\n"
-            "/ml - Show ML analysis and performance stats\n"
-            "/stop - Emergency stop (closes all positions)\n"
-            "/help - Show this help message"
+            await self.app.bot.send_message(chat_id=Config.TG_CHAT_ID, text=text, parse_mode="Markdown")
+        except Exception as e: logger.error(f"TG Error: {e}")
+
+    async def send_entry_alert(self, direction, price, sl, tp, pattern):
+        emoji = "🟢" if direction == "LONG" else "🔴"
+        text = (
+            f"{emoji} **NEW TRADE: {direction}**\n"
+            f"Pattern: `{pattern}`\n"
+            f"Entry: `{price}`\n"
+            f"SL: `{sl}`\n"
+            f"Exit: Trailing Stop\n"
+            f"_Executing automatically..._"
         )
-    
-    async def cmd_stop(self, update: Update, context: ContextTypes_DEFAULT_TYPE) -> None:
-        """Handle /stop command - emergency stop."""
-        await update.message.reply_text("🛑 Emergency stop initiated...")
-        
-        if self._stop_callback:
-            try:
-                await self._stop_callback()
-                await update.message.reply_text("✅ All positions closed successfully")
-            except Exception as e:
-                await update.message.reply_text(f"❌ Error: {e}")
-        else:
-            await update.message.reply_text("⚠️ Stop callback not configured")
-    
-    async def cmd_close(self, update: Update, context: ContextTypes_DEFAULT_TYPE) -> None:
-        """Handle /close command - close current position manually."""
-        if not self._close_position_callback:
-            await update.message.reply_text("⚠️ Close position functionality not configured")
-            return
-            
-        try:
-            await update.message.reply_text("🔄 Closing current position...")
-            result = await self._close_position_callback()
-            await update.message.reply_text(result)
-        except Exception as e:
-            logger.error(f"Error in /close command: {e}")
-            await update.message.reply_text(f"❌ Error closing position: {e}")
-    
-    async def cmd_status(self, update: Update, context: ContextTypes_DEFAULT_TYPE) -> None:
-        """Handle /status command."""
-        if self._get_status_callback:
-            try:
-                status = await self._get_status_callback()
-                await update.message.reply_text(status)
-            except Exception as e:
-                await update.message.reply_text(f"❌ Error getting status: {e}")
-        else:
-            await update.message.reply_text("⚠️ Status callback not configured")
-    
-    async def cmd_balance(self, update: Update, context: ContextTypes_DEFAULT_TYPE) -> None:
-        """Handle /balance command."""
-        if self._get_balance_callback:
-            try:
-                balance = await self._get_balance_callback()
-                await update.message.reply_text(balance)
-            except Exception as e:
-                await update.message.reply_text(f"❌ Error getting balance: {e}")
-        else:
-            await update.message.reply_text("⚠️ Balance callback not configured")
-    
-    async def cmd_help(self, update: Update, context: ContextTypes_DEFAULT_TYPE) -> None:
-        """Handle /help command."""
-        await update.message.reply_text(
-            "📖 Institutional Trap v3.0 Help\n\n"
-            "This bot trades the 'Institutional Trap v3.0' strategy:\n"
-            "- Detects liquidity sweeps with delta divergence\n"
-            "- Confirms absorption via cumulative delta\n"
-            "- Enters on micro-structure triggers\n"
-            "- Uses intelligent ATR-based trailing stops\n"
-            "- ML-powered trade selection (learns from past trades)\n"
-            "- Exits on: Stop Loss, Trailing Stop, or Opposite Signal\n\n"
-            "Commands:\n"
-            "/start - Start the bot\n"
-            "/status - Show current position and PnL\n"
-            "/close - Close current position manually\n"
-            "/balance - Show account balance\n"
-            "/ml - Show ML analysis and performance stats\n"
-            "/stop - Emergency stop (closes all positions)\n"
-            "/help - Show this help message\n\n"
-            "Risk Warning: Trading involves substantial risk."
-        )
-    
-    async def cmd_ml(self, update: Update, context: ContextTypes_DEFAULT_TYPE) -> None:
-        """Handle /ml command - show ML analysis."""
-        if self._get_ml_analysis_callback:
-            try:
-                analysis = await self._get_ml_analysis_callback()
-                await update.message.reply_text(analysis, parse_mode='HTML')
-            except Exception as e:
-                await update.message.reply_text(f"❌ Error getting ML analysis: {e}")
-        else:
-            await update.message.reply_text("⚠️ ML analysis not configured")
-    
-    def set_callbacks(
-        self,
-        get_status: callable,
-        get_balance: callable,
-        stop_trading: callable,
-        get_ml_analysis: callable = None,
-        close_position: callable = None
-    ) -> None:
-        """
-        Set callback functions for commands.
-        
-        Args:
-            get_status: Async function returning status string
-            get_balance: Async function returning balance string
-            stop_trading: Async function to emergency stop
-            get_ml_analysis: Optional async function for ML analysis
-            close_position: Optional async function to close current position
-        """
-        self._get_status_callback = get_status
-        self._get_balance_callback = get_balance
-        self._stop_callback = stop_trading
-        self._get_ml_analysis_callback = get_ml_analysis
-        self._close_position_callback = close_position
-        
-        # Add ML analysis command handler if callback provided
-        if get_ml_analysis and self.application:
-            self.application.add_handler(CommandHandler("ml", self.cmd_ml))
-    
-    async def send_message(self, message: str) -> None:
-        """
-        Send generic message to chat (alias for send_notification).
-        
-        Args:
-            message: Message to send
-        """
-        await self.send_notification(message)
-    
-    async def send_notification(self, message: str) -> None:
-        """
-        Send notification message to chat.
-        
-        Args:
-            message: Message to send
-        """
-        if not TELEGRAM_AVAILABLE or not self.application:
-            return
-        
-        if not self.config.TELEGRAM_CHAT_ID:
-            return
-        
-        try:
-            await self.application.bot.send_message(
-                chat_id=self.config.TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logger.error(f"Failed to send Telegram notification: {e}")
-    
-    async def send_entry_notification(self, signal: Dict[str, Any]) -> None:
-        """Send entry signal notification."""
-        direction_emoji = "🟢" if signal['direction'] == 'LONG' else "🔴"
-        message = (
-            f"{direction_emoji} <b>ENTRY SIGNAL</b>\n\n"
-            f"Direction: {signal['direction']}\n"
-            f"Entry Price: {signal['entry_price']:.2f}\n"
-            f"Signal Type: {signal['signal_type']}\n"
-            f"Confidence: {signal['confidence']:.0%}"
-        )
-        await self.send_notification(message)
-    
-    async def send_exit_notification(
-        self,
-        direction: str,
-        entry_price: float,
-        exit_price: float,
-        pnl: float,
-        reason: str
-    ) -> None:
-        """Send position exit notification."""
-        direction_emoji = "🟢" if direction == 'LONG' else "🔴"
-        pnl_emoji = "💰" if pnl >= 0 else "💸"
-        pnl_sign = "+" if pnl >= 0 else ""
-        
-        message = (
-            f"{direction_emoji} <b>POSITION CLOSED</b>\n\n"
-            f"Direction: {direction}\n"
-            f"Entry: {entry_price:.2f}\n"
-            f"Exit: {exit_price:.2f}\n"
-            f"PnL: {pnl_emoji} {pnl_sign}{pnl:.2f} USDT\n"
+        await self.send_message(text)
+
+    async def send_exit_alert(self, profit, reason):
+        color = "🟢" if profit > 0 else "🔴" if profit < 0 else "⚪"
+        text = (
+            f"{color} **CLOSED**\n"
+            f"PnL: `{profit:.2f} USD`\n"
             f"Reason: {reason}"
         )
-        await self.send_notification(message)
+        await self.send_message(text)
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("🤖 SMC 3-TF Bot Online. Waiting for 1H Range...")
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        pos = self.agent.mt5.get_position(Config.SYMBOL)
+        if pos:
+            txt = (
+                f"📊 **Active**\n"
+                f"{'BUY' if pos.type == 0 else 'SELL'}\n"
+                f"PnL: `{pos.profit:.2f} USD`"
+            )
+        else:
+            txt = "✅ No active positions."
+        await update.message.reply_text(txt, parse_mode="Markdown")
+
+    async def cmd_close(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("🔄 Closing position...")
+        await self.agent.close_position(reason="Manual Close")
+
+    async def cmd_ml(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        count = self.agent.db.get_trade_count()
+        status = "Active" if self.agent.ml.model else "Collecting Data..."
+        await update.message.reply_text(f"🧠 **ML Status**\nTrades: `{count}`\nModel: {status}", parse_mode="Markdown")
+
+    async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Stop command received from Telegram")
+        
+        # 1. Stop the main loop immediately
+        self.agent.running = False
+        
+        # 2. Reply to user immediately
+        await update.message.reply_text(
+            "🛑 **STOP COMMAND RECEIVED**\n\n"
+            "Bot is shutting down...\n"
+            "No new trades will be opened.\n"
+            "Existing positions will remain managed until closed.",
+            parse_mode="Markdown"
+        )
     
-    async def send_error_notification(self, error: str) -> None:
-        """Send error notification."""
-        message = f"❌ <b>ERROR</b>\n\n{error}"
-        await self.send_notification(message)
+    async def send_trail_alert(self, direction, new_sl, current_price, profit_points):
+        """Sends an alert specifically for Trailing Stop updates"""
+        emoji = "🟢" if direction == "LONG" else "🔴"
+        color = "🟢" if profit_points > 0 else "⚪"
+        
+        text = (
+            f"{emoji} **TRAILING STOP UPDATED**\n"
+            f"Direction: {direction}\n"
+            f"Current Price: `{current_price}`\n"
+            f"New Stop Loss: `{new_sl}`\n"
+            f"Locked Profit: `{color} {profit_points:.2f} pts`\n"
+            f"_Stop loss moved to lock in profits._"
+        )
+        await self.send_message(text)

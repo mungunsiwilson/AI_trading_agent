@@ -1,433 +1,333 @@
-"""
-Core strategy logic for Institutional Trap v3.0.
-Implements the symmetric "Reaction Time" model for both long and short entries.
-"""
-
-import logging
-from typing import Optional, Dict, Any, List, Tuple
-from dataclasses import dataclass
-from enum import Enum
+import pandas as pd
 import numpy as np
-
+import asyncio
+import MetaTrader5 as mt5
+from datetime import datetime, timedelta
 from config import Config
-from strategy.indicators import VWMA, ATR, DeltaCalculator, MomentumDetector
-from data.buffers import CircularBuffer, OrderBookDepth
+from execution.mt5_client import MT5Client
+from utils.logger import get_logger
 
+logger = get_logger("Strategy")
 
-logger = logging.getLogger("institutional_trap_v3")
+class SMCEngine:
+    def __init__(self):
+        # State: 'IDLE', 'SWEEP_DETECTED', 'INVALIDATED'
+        self.state = 'IDLE'
+        self.mt5 = MT5Client()
+        
+        # 1H Range Data
+        self.range_high = None
+        self.range_low = None
+        self.range_start_time = None # Time when current range was fetched
+        self.last_fetch_time = None  # Timestamp of last fetch (for 60m lock)
+        self.entry_count = 0 # Count of entries taken in current range, for ML feature tracking
+        self.MAX_ENTRIES = 1 # Max entries per sweep to prevent overtrading
+        self.ENTRY_COOLDOWN_SEC = 60 # Minimum seconds between entries in the same range, for ML feature tracking
+        self.last_entry_time = None # Timestamp of last entry taken, for cooldown tracking
+        # Sweep Data
+        self.sweep_direction = None # 'LONG' (swept low) or 'SHORT' (swept high)
+        self.order_block_high = None
+        self.order_block_low = None
+        self.sweep_time = None
+        self.sweep_wick_extreme = None # Store the extreme wick price for SL calculation
+        
 
-
-class Direction(Enum):
-    """Trade direction."""
-    LONG = 1
-    SHORT = -1
-
-
-@dataclass
-class EntrySignal:
-    """Entry signal data structure."""
-    direction: Direction
-    entry_price: float
-    signal_type: str
-    confidence: float  # 0-1 confidence score
-    timestamp: int
-    
-    def to_dict(self) -> Dict[str, Any]:
+    def get_current_state(self):
         return {
-            'direction': self.direction.name,
-            'entry_price': self.entry_price,
-            'signal_type': self.signal_type,
-            'confidence': self.confidence,
-            'timestamp': self.timestamp,
+            'state': self.state,
+            'range_high': self.range_high,
+            'range_low': self.range_low,
+            'sweep_dir': self.sweep_direction,
+            'ob_high': self.order_block_high,
+            'ob_low': self.order_block_low
         }
 
-
-class StrategyCore:
-    """
-    Core strategy implementation for Institutional Trap v3.0.
-    Symmetric logic for both long and short positions.
-    """
-    
-    def __init__(self, config: Config):
+    def analyze_1h_range(self, df_1h):
         """
-        Initialize strategy core.
-        
-        Args:
-            config: Configuration object
+        Call this ONLY when state is IDLE and we need to fetch levels.
+        Checks 60-min cooldown.
+        Returns True if new levels fetched, False otherwise.
         """
-        self.config = config
+        now = datetime.now()
         
-        # Indicators
-        self.vwma_h1 = VWMA(config.VWMA_PERIOD_H1)
-        self.atr_m1 = ATR(config.ATR_PERIOD)
-        self.delta_calc = DeltaCalculator(config.DELTA_AVERAGE_PERIOD)
-        self.momentum_detector = MomentumDetector(config.MOMENTUM_EVALUATION_PERIOD)
-        
-        # Data buffers for 1-minute bars
-        self.highs_m1 = CircularBuffer(maxlen=50)
-        self.lows_m1 = CircularBuffer(maxlen=50)
-        self.closes_m1 = CircularBuffer(maxlen=50)
-        self.volumes_m1 = CircularBuffer(maxlen=50)
-        self.deltas_m1 = CircularBuffer(maxlen=50)
-        
-        # State tracking
-        self._current_bar_open: Optional[float] = None
-        self._current_bar_high: Optional[float] = None
-        self._current_bar_low: Optional[float] = None
-        self._current_bar_close: Optional[float] = None
-        self._current_bar_volume: Optional[float] = None
-        self._current_bar_timestamp: Optional[int] = None
-        
-        # Order book state
-        self._orderbook_depth = OrderBookDepth(config.ORDERBOOK_LEVELS)
-        self._bid_depth_before_sweep: float = 0.0
-        self._ask_depth_before_sweep: float = 0.0
-        
-        # Tick speed tracking
-        self._trades_per_second: float = 0.0
-        self._trades_per_second_during_sweep: float = 0.0
-        self._last_trade_time: int = 0
-        self._recent_trade_count: int = 0
-        
-        # Sweep detection state
-        self._sweep_detected: bool = False
-        self._sweep_direction: Optional[Direction] = None
-        self._sweep_price: float = 0.0
-        self._bars_since_sweep: int = 0
-        self._absorption_confirmed: bool = False
-        
-        # Current market state
-        self._current_mark_price: float = 0.0
-        self._h1_vwma: float = 0.0
-    
-    def update_h1_candle(self, close: float, volume: float) -> float:
-        """
-        Update 1-hour VWMA with new candle.
-        
-        Args:
-            close: Candle close price
-            volume: Candle volume
-        
-        Returns:
-            Updated VWMA value
-        """
-        self._h1_vwma = self.vwma_h1.update(close, volume)
-        return self._h1_vwma
-    
-    def update_m1_candle(
-        self,
-        open_price: float,
-        high: float,
-        low: float,
-        close: float,
-        volume: float,
-        delta: float,
-        timestamp: int
-    ) -> None:
-        """
-        Update 1-minute bar data.
-        
-        Args:
-            open_price: Candle open
-            high: Candle high
-            low: Candle low
-            close: Candle close
-            volume: Candle volume
-            delta: Bar delta (buy vol - sell vol)
-            timestamp: Bar timestamp
-        """
-        self.highs_m1.append(high)
-        self.lows_m1.append(low)
-        self.closes_m1.append(close)
-        self.volumes_m1.append(volume)
-        self.deltas_m1.append(delta)
-        
-        # Update ATR
-        self.atr_m1.update(high, low, close)
-        
-        # Store current bar info
-        self._current_bar_open = open_price
-        self._current_bar_high = high
-        self._current_bar_low = low
-        self._current_bar_close = close
-        self._current_bar_volume = volume
-        self._current_bar_timestamp = timestamp
-    
-    def update_mark_price(self, price: float) -> None:
-        """Update current mark price."""
-        self._current_mark_price = price
-    
-    def update_orderbook(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> None:
-        """
-        Update order book depth.
-        
-        Args:
-            bids: List of (price, size) tuples
-            asks: List of (price, size) tuples
-        """
-        self._orderbook_depth.update_bids(bids)
-        self._orderbook_depth.update_asks(asks)
-    
-    def add_trade(self, price: float, size: float, side: str, timestamp: int) -> None:
-        """
-        Add trade for tick speed calculation.
-        
-        Args:
-            price: Trade price
-            size: Trade size
-            side: Trade side ('buy' or 'sell')
-            timestamp: Trade timestamp in ms
-        """
-        # Calculate trades per second
-        if self._last_trade_time > 0:
-            time_diff_ms = timestamp - self._last_trade_time
-            if time_diff_ms > 0:
-                self._recent_trade_count += 1
-                # Rolling average over 1 second
-                if time_diff_ms >= 1000:
-                    self._trades_per_second = self._recent_trade_count / (time_diff_ms / 1000)
-                    self._recent_trade_count = 0
+        # Check Cooldown: Must be 60 mins since last fetch
+        if self.last_fetch_time:
+            elapsed = now - self.last_fetch_time
+            if elapsed < timedelta(minutes=60):
+                if not hasattr(self, '_wait_message_printed') or not self._wait_message_printed:
+                    logger.info(f"Level Lock Active: Waiting {60 - elapsed.total_seconds()/60:.1f} more mins.")
+                    self._wait_message_printed = True
+                return False
         else:
-            self._recent_trade_count = 1
-        
-        self._last_trade_time = timestamp
-        
-        # Add to delta calculator
-        self.delta_calc.add_trade(price, size, side, timestamp)
-    
-    def finalize_bar(self) -> float:
-        """
-        Finalize current bar delta.
-        
-        Returns:
-            Bar delta
-        """
-        return self.delta_calc.finalize_bar()
-    
-    def _check_macro_trend(self, direction: Direction) -> bool:
-        """
-        Check Layer 1: Macro trend filter.
-        
-        Args:
-            direction: Intended trade direction
-        
-        Returns:
-            True if macro trend allows entry
-        """
-        if not self.vwma_h1.is_ready():
+            self._wait_message_printed = False
+
+        if len(df_1h) < 2:
             return False
+
+        # Get last CLOSED hourly candle (iloc[-2] because iloc[-1] is forming)
+        last_closed = df_1h.iloc[-2] 
         
-        if direction == Direction.LONG:
-            return self._current_mark_price > self._h1_vwma
-        else:  # SHORT
-            return self._current_mark_price < self._h1_vwma
+        self.range_high = last_closed['high']
+        self.range_low = last_closed['low']
+        self.range_start_time = last_closed['time']
+        self.last_fetch_time = now
+        
+        self.state = 'IDLE'
+        logger.info(f"New 1H Range Fetch: High={self.range_high}, Low={self.range_low}. Locked for 60m.")
+        return True
+
+    def analyze_5m_sweep(self, df_5m, range_high, range_low, range_start_time, df_1h):
+        """
+        Scans 5m candles for sweep. 
+        IMMEDIATELY checks trend alignment. If against trend -> INVALIDATE.
+        """
+        if len(df_5m) < 2:
+            return None
+
+        # 1. Identify Time Boundary
+        #mask = (df_5m['time'] > range_start_time) & (df_5m.index < len(df_5m) - 1)
+        scan_df = df_5m
+
+        if scan_df.empty:
+            return None
+            print("No 5m data to scan for sweeps.")
+
+        candidate = scan_df.iloc[-2]
+        swept_low = candidate['low'] < range_low and candidate['close'] > range_low
+        swept_high = candidate['high'] > range_high and candidate['close'] < range_high
+
+        # If no sweep happened, check for Range Breakout (Invalidation Rule 1)
+        if not swept_low and not swept_high:
+            close_out_up = candidate['close'] > range_high
+            close_out_down = candidate['close'] < range_low
+            if close_out_up or close_out_down:
+                logger.info(f"Range Broken (No Sweep). Invalidating.")
+                return {'type': 'INVALIDATE'}
+            return None
+
+        # 2. Determine Potential Direction
+        potential_dir = None
+        if swept_low:
+            potential_dir = 'LONG' # Swept low, expect bounce up
+            ob_high = max(candidate['high'], candidate['low'])
+            ob_low = min(candidate['high'], candidate['low'])
+            print(f"Sweep Low Detected at {candidate['time']}. OB: {ob_low}-{ob_high}")
+        elif swept_high:
+            potential_dir = 'SHORT' # Swept high, expect drop down
+            ob_high = max(candidate['high'], candidate['low'])
+            ob_low = min(candidate['high'], candidate['low'])
+            print(f"Sweep High Detected at {candidate['time']}. OB: {ob_low}-{ob_high}")
+
+        # 3. IMMEDIATE TREND CHECK
+        # We need 1H data here to confirm trend before accepting the sweep
+        if df_1h is not None and len(df_1h) > 200:
+            trend = self.get_trend_direction(df_1h)
+            print(f"Trend Check: {trend}, Potential Sweep Direction: {potential_dir}")
+            
+            if potential_dir == 'LONG' and trend != 'UP':
+                logger.warning(f"Sweep LONG detected, but Trend is {trend}. INVALIDATING.")
+                return {'type': 'INVALIDATE'}
+            
+            if potential_dir == 'SHORT' and trend != 'DOWN':
+                logger.warning(f"Sweep SHORT detected, but Trend is {trend}. INVALIDATING.")
+                return {'type': 'INVALIDATE'}
+                
+            if trend == 'NEUTRAL':
+                logger.warning("Trend is Neutral (Price ~ EMA). Skipping Setup.")
+                return None
+        else:
+            logger.warning("1H Data not available for Trend Check. Proceeding with caution.")
+        
+        # Store the extreme wick for SL calculation later
+        sweep_wick_extreme = candidate['low'] if potential_dir == 'LONG' else candidate['high']
+
+        logger.info(f"Sweep Detected ({potential_dir}) aligned with Trend. OB: {ob_low}-{ob_high}")
+        
+        return {
+            'type': 'SWEEP',
+            'direction': potential_dir,
+            'ob_high': ob_high,
+            'ob_low': ob_low,
+            'sweep_wick_extreme': sweep_wick_extreme,
+            'time': candidate['time']
+        }
+
+    def analyze_1m_entry(self, df_1m, ob_high, ob_low, direction, sweep_wick_extreme, range_high, range_low, df_1h=None):
+        """
+        Checks last 2 CLOSED 1m candles for confirmation patterns.
+        Returns FULL SIGNAL dict if entry found.
+        """
+        now = datetime.now()
+
+        # 1. Check Max Entries Limit
+        if self.entry_count >= self.MAX_ENTRIES:
+            return None  # Stop signaling after 3 trades
+
+        # 2. Check Time Cooldown (1 minute)
+        if self.last_entry_time:
+            elapsed = (now - self.last_entry_time).total_seconds()
+            if elapsed < self.ENTRY_COOLDOWN_SEC:
+                return None  # Wait for cooldown
+
+        if len(df_1m) < 3:
+            return None
+            
+        c1 = df_1m.iloc[-3] # Older
+        c2 = df_1m.iloc[-2] # Newest (Just closed)
+        
+        # Define OB Range
+        ob_top = ob_high
+        ob_bot = ob_low
+        
+        # Check Overlap: At least one candle must touch the OB
+        # For Long: Low of candles <= OB Top
+        # For Short: High of candles >= OB Bot
+        overlap = False
+        in_ob_c1_low = ob_bot <= c1['low'] <= ob_top
+        in_ob_c1_high = ob_bot <= c1['high'] <= ob_top      
+        in_ob_c2_low = ob_bot <= c2['low'] <= ob_top
+        in_ob_c2_high = ob_bot <= c2['high'] <= ob_top
     
-    def _check_exhaustion_signal(self, direction: Direction) -> Tuple[bool, bool]:
-        """
-        Check Layer 2: Exhaustion signal (sweep + absorption).
+        if in_ob_c1_low or in_ob_c1_high or in_ob_c2_low or in_ob_c2_high:
+                overlap = True
+        else:
+            overlap = False
+
+        if not overlap:
+            # Invalidation Rule 4 Check: Price moved away completely
+            if direction == 'LONG':
+                if c2['close'] < ob_bot and c2['high'] < ob_bot:
+                    logger.info("Price rejected OB downwards. Invalidating.")
+                    return {'type': 'INVALIDATE'}
+            if direction == 'SHORT':
+                if c2['close'] > ob_top and c2['low'] > ob_top:
+                    logger.info("Price rejected OB upwards. Invalidating.")
+                    return {'type': 'INVALIDATE'}
+            return None
+
+        pattern_name = None
+        entry_price = c2['close']
         
-        Args:
-            direction: Intended trade direction
-        
-        Returns:
-            Tuple of (sweep_detected, absorption_confirmed)
-        """
-        if len(self.deltas_m1) < self.config.DELTA_AVERAGE_PERIOD:
-            return False, False
-        
-        deltas = self.deltas_m1.get_array()
-        lows = self.lows_m1.get_array()
-        highs = self.highs_m1.get_array()
-        
-        avg_abs_delta = self.delta_calc.get_average_abs_delta()
-        if avg_abs_delta == 0:
-            return False, False
-        
-        spike_threshold = self.config.DELTA_SPIKE_MULTIPLIER * avg_abs_delta
-        
-        # Check for sweep in opposite direction
-        if direction == Direction.LONG:
-            # Look for new 10-period low with massive sell volume
-            if len(lows) >= self.config.DELTA_SWEEP_PERIOD_M1:
-                recent_lows = lows[-self.config.DELTA_SWEEP_PERIOD_M1:]
-                current_low = lows[-1]
-                
-                # Check if we made a new low
-                is_new_low = current_low <= np.min(recent_lows[:-1]) if len(recent_lows) > 1 else True
-                
-                # Check if delta is significantly negative
-                current_delta = deltas[-1]
-                is_negative_spike = current_delta < -spike_threshold
-                
-                if is_new_low and is_negative_spike:
-                    self._sweep_detected = True
-                    self._sweep_direction = Direction.LONG
-                    self._sweep_price = current_low
-                    self._bars_since_sweep = 0
-                    self._bid_depth_before_sweep = self._orderbook_depth.get_bid_depth()
-                    return True, False
-        
-        else:  # SHORT
-            # Look for new 10-period high with massive buy volume
-            if len(highs) >= self.config.DELTA_SWEEP_PERIOD_M1:
-                recent_highs = highs[-self.config.DELTA_SWEEP_PERIOD_M1:]
-                current_high = highs[-1]
-                
-                # Check if we made a new high
-                is_new_high = current_high >= np.max(recent_highs[:-1]) if len(recent_highs) > 1 else True
-                
-                # Check if delta is significantly positive
-                current_delta = deltas[-1]
-                is_positive_spike = current_delta > spike_threshold
-                
-                if is_new_high and is_positive_spike:
-                    self._sweep_detected = True
-                    self._sweep_direction = Direction.SHORT
-                    self._sweep_price = current_high
-                    self._bars_since_sweep = 0
-                    self._ask_depth_before_sweep = self._orderbook_depth.get_ask_depth()
-                    return True, False
-        
-        # If sweep was previously detected, check for absorption
-        if self._sweep_detected and self._sweep_direction == direction:
-            self._bars_since_sweep += 1
+        # Check Patterns
+        if direction == 'LONG':
+            if self.is_bullish_engulfing(c1, c2):
+                pattern_name = "Bullish Engulfing"
+            elif self.is_hammer(c2):
+                pattern_name = "Hammer"
+                    
+        elif direction == 'SHORT':
+            if self.is_bearish_engulfing(c1, c2):
+                pattern_name = "Bearish Engulfing"
+            elif self.is_shooting_star(c2):
+                pattern_name = "Shooting Star"
+
+        if pattern_name:
+            logger.info(f"{pattern_name} Confirmation Found! (Trade #{self.entry_count + 1}) Preparing Signal.")
+
+            # Calculate Stop Loss (Beyond Wick Extreme + Buffer)
+            if direction == 'LONG':
+                sl_price = sweep_wick_extreme - Config.SL_BUFFER_POINTS
+                tp_price = 0.0 # Target opposite liquidity
+            else:
+                sl_price = sweep_wick_extreme + Config.SL_BUFFER_POINTS
+                tp_price = 0.0
             
-            # Check if we're within the absorption window (1-3 bars)
-            if self._bars_since_sweep > self.config.ABSORPTION_BARS_MAX:
-                self._sweep_detected = False
-                return False, False
-            
-            # Check that price hasn't made a new extreme
-            if direction == Direction.LONG:
-                if len(lows) >= 2 and lows[-1] < self._sweep_price:
-                    # New low made, invalidates setup
-                    self._sweep_detected = False
-                    return False, False
-                
-                # Check cumulative delta is flat or positive
-                cum_delta = self.delta_calc.get_cumulative_delta(self._bars_since_sweep)
-                absorption = cum_delta >= 0
-                
-            else:  # SHORT
-                if len(highs) >= 2 and highs[-1] > self._sweep_price:
-                    # New high made, invalidates setup
-                    self._sweep_detected = False
-                    return False, False
-                
-                # Check cumulative delta is flat or negative
-                cum_delta = self.delta_calc.get_cumulative_delta(self._bars_since_sweep)
-                absorption = cum_delta <= 0
-            
-            if absorption and self._bars_since_sweep >= self.config.ABSORPTION_BARS_MIN:
-                self._absorption_confirmed = True
-                return True, True
-        
-        return self._sweep_detected, self._absorption_confirmed
-    
-    def _check_micro_structure(self, direction: Direction) -> bool:
-        """
-        Check Layer 3: Micro-structure trigger.
-        
-        Args:
-            direction: Intended trade direction
-        
-        Returns:
-            True if micro-structure conditions are met
-        """
-        # Check tick speed drop
-        if self._trades_per_second_during_sweep == 0:
-            return False
-        
-        tick_speed_ratio = self._trades_per_second / self._trades_per_second_during_sweep
-        tick_speed_drop = tick_speed_ratio < self.config.TICK_SPEED_DROP_THRESHOLD
-        
-        # Check order book depth increase
-        if direction == Direction.LONG:
-            current_bid_depth = self._orderbook_depth.get_bid_depth()
-            if self._bid_depth_before_sweep == 0:
-                return False
-            depth_increase = (current_bid_depth - self._bid_depth_before_sweep) / self._bid_depth_before_sweep
-            depth_condition = depth_increase >= self.config.ORDERBOOK_DEPTH_INCREASE_THRESHOLD
-        else:  # SHORT
-            current_ask_depth = self._orderbook_depth.get_ask_depth()
-            if self._ask_depth_before_sweep == 0:
-                return False
-            depth_increase = (current_ask_depth - self._ask_depth_before_sweep) / self._ask_depth_before_sweep
-            depth_condition = depth_increase >= self.config.ORDERBOOK_DEPTH_INCREASE_THRESHOLD
-        
-        return tick_speed_drop and depth_condition
-    
-    def should_enter(self) -> Optional[EntrySignal]:
-        """
-        Main entry point: check all layers and return entry signal if conditions met.
-        
-        Returns:
-            EntrySignal if entry conditions are met, None otherwise
-        """
-        # Check both directions based on trading mode
-        directions_to_check = []
-        
-        if self.config.TRADING_MODE in ["BOTH", "LONG_ONLY"]:
-            directions_to_check.append(Direction.LONG)
-        if self.config.TRADING_MODE in ["BOTH", "SHORT_ONLY"]:
-            directions_to_check.append(Direction.SHORT)
-        
-        for direction in directions_to_check:
-            # Layer 1: Macro trend
-            if not self._check_macro_trend(direction):
-                continue
-            
-            # Layer 2: Exhaustion signal
-            sweep_detected, absorption_confirmed = self._check_exhaustion_signal(direction)
-            
-            if not absorption_confirmed:
-                continue
-            
-            # Layer 3: Micro-structure trigger
-            if self._check_micro_structure(direction):
-                # All conditions met!
-                signal = EntrySignal(
-                    direction=direction,
-                    entry_price=self._current_mark_price,
-                    signal_type="institutional_trap_v3",
-                    confidence=0.8,  # Could be calculated based on signal strength
-                    timestamp=self._current_bar_timestamp or 0,
-                )
-                
-                # Reset state after signal
-                self._sweep_detected = False
-                self._absorption_confirmed = False
-                self._bars_since_sweep = 0
-                
-                return signal
-        
+            # Validate SL/TP makes sense
+            if direction == 'LONG' and sl_price >= entry_price:
+                sl_price = entry_price - (ob_top - ob_bot) # Fallback to OB height
+            if direction == 'SHORT' and sl_price <= entry_price:
+                sl_price = entry_price + (ob_top - ob_bot)
+
+            return {
+                'type': 'ENTRY',
+                'direction': direction,
+                'entry_price': entry_price,
+                'stop_loss': sl_price,
+                'pattern': pattern_name,
+                'features': { # For ML
+                    'wick_ratio': 0.5, # Placeholder, calculate if needed
+                    'body_ratio': 0.5,
+                    'vol_ratio': 1.0,
+                    'pattern_type': 1 if "Engulfing" in pattern_name else 2,
+                    'hour': datetime.now().hour,
+                    'direction': 1 if direction == 'LONG' else -1
+                }
+            }
+
         return None
-    
-    def get_atr(self) -> float:
-        """Get current ATR value."""
-        return self.atr_m1.get_value()
-    
-    def is_ready(self) -> bool:
-        """Check if strategy has enough data to generate signals."""
-        return (
-            self.vwma_h1.is_ready() and
-            self.atr_m1.is_ready() and
-            self.delta_calc.is_ready() and
-            len(self.deltas_m1) >= self.config.DELTA_AVERAGE_PERIOD
-        )
-    
-    def reset(self) -> None:
-        """Reset all state."""
-        self.vwma_h1.clear()
-        self.atr_m1.clear()
-        self.delta_calc.clear()
-        self.momentum_detector.clear()
-        self.highs_m1.clear()
-        self.lows_m1.clear()
-        self.closes_m1.clear()
-        self.volumes_m1.clear()
-        self.deltas_m1.clear()
+    def get_trend_direction(self, df_1h):
+        """
+        Determines the current trend based on the 200 EMA on the 1H timeframe.
         
-        self._sweep_detected = False
-        self._absorption_confirmed = False
-        self._bars_since_sweep = 0
+        Args:
+            df_1h (pd.DataFrame): 1-Hour candlestick data with 'close' column.
+            
+        Returns:
+            str: 'UP' if price > 200 EMA, 'DOWN' if price < 200 EMA, 'NEUTRAL' otherwise.
+        """
+
+        if df_1h is None or len(df_1h) < 200:
+            return 'NEUTRAL'
+
+        try:
+            # Calculate 200 EMA
+            ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean()
+            
+            # Get the last CLOSED candle's close price and EMA value
+            # We use iloc[-2] to ensure we are using confirmed data, not the forming candle
+            last_close = df_1h.iloc[-2]['close']
+            last_ema = ema_200.iloc[-2]
+
+            # Determine Trend
+            if last_close > last_ema:
+                print(f"DEBUG: Last Close={last_close}, EMA200={last_ema}")
+                return 'UP'
+                
+            elif last_close < last_ema:
+                print(f"DEBUG: Last Close={last_close}, EMA200={last_ema}")
+                return 'DOWN'
+            else:
+                return 'NEUTRAL'
+                        
+        except Exception as e:
+            logger.error(f"Error calculating trend direction: {e}")
+            return 'NEUTRAL'
+        
+    # --- Pattern Helpers ---
+    def is_bullish_engulfing(self, c1, c2):
+        if c2['close'] <= c2['open']: return False
+        if c1['close'] >= c1['open']: return False
+        #print(f"Bullish Engulfing: C1 Open={c1['open']}, C1 Close={c1['close']}, C2 Open={c2['open']}, C2 Close={c2['close']}")
+        return c2['open'] < c1['close'] and c2['close'] > c1['open']
+    
+    def is_hammer(self, c):
+        body = abs(c['close'] - c['open'])
+        if body == 0: return False
+        lower_wick = min(c['close'], c['open']) - c['low']
+        upper_wick = c['high'] - max(c['close'], c['open'])
+        #print(f"Hammer: Body={body}, Lower Wick={lower_wick}, Upper Wick={upper_wick}")
+        return (lower_wick > body * 2) and (upper_wick < body * 0.5) and (c['close'] > c['open'])
+
+    def is_bearish_engulfing(self, c1, c2):
+        if c2['close'] >= c2['open']: return False
+        if c1['close'] <= c1['open']: return False
+        #print(f"Bearish Engulfing: C1 Open={c1['open']}, C1 Close={c1['close']}, C2 Open={c2['open']}, C2 Close={c2['close']}")
+        return c2['open'] > c1['close'] and c2['close'] < c1['open']
+
+    def is_shooting_star(self, c):
+        body = abs(c['close'] - c['open'])
+        if body == 0: return False
+        lower_wick = min(c['close'], c['open']) - c['low']
+        upper_wick = c['high'] - max(c['close'], c['open'])
+        #print(f"Shooting Star: Body={body}, Lower Wick={lower_wick}, Upper Wick={upper_wick}")
+        return (upper_wick > body * 2) and (lower_wick < body * 0.5) and (c['close'] < c['open'])
+
+    def invalidate_setup(self):
+        logger.warning("Setup Invalidated. Entering Cooldown.")
+        self.state = 'INVALIDATED'
+        self.entry_count = 0
+        self.last_entry_time = None
+        self.sweep_direction = None
+        self.order_block_high = None
+        self.order_block_low = None
+        self.sweep_wick_extreme = None
