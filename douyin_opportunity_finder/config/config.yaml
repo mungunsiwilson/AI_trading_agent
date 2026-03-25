@@ -1,0 +1,57 @@
+# AG2 (AutoGen) Configuration
+llm_config:
+  config_list:
+    - model: gpt-4o
+      api_key: ${OPENAI_API_KEY}
+      base_url: https://api.openai.com/v1
+  temperature: 0.7
+  max_tokens: 2048
+  timeout: 60
+
+# Agent Configuration
+agents:
+  douyin_scout:
+    name: "DouyinScoutAgent"
+    description: "Fetches trending products from Douyin using TikHub API"
+    system_message: |
+      You are an expert at finding trending products on Douyin (Chinese TikTok).
+      Your task is to fetch the latest hot-rising products and extract relevant information.
+      Focus on products with keywords like '好物' (good items), '推荐' (recommended), etc.
+      Return structured data with title, hot_count, item_id, and url.
+  
+  tiktok_checker:
+    name: "TikTokCheckerAgent"
+    description: "Checks if products exist on TikTok Shop US/UK"
+    system_message: |
+      You are responsible for cross-referencing Douyin products against TikTok Shop databases.
+      Use fuzzy matching to determine if a product already exists on TikTok Shop.
+      If similarity ratio >= 0.8, mark as existing. Return only products NOT found.
+  
+  market_validator:
+    name: "MarketValidatorAgent"
+    description: "Validates market potential using Amazon and Reddit data"
+    system_message: |
+      You are a market research expert specializing in e-commerce opportunities.
+      Analyze each product gap using Amazon competition data and Reddit sentiment.
+      Score products 1-10 based on:
+      - Competition level (fewer sellers = higher score)
+      - Reddit sentiment (positive mentions = higher score)
+      - Cultural fit (Western market alignment)
+      - Visual appeal (video potential)
+      - Price point ($10-50 ideal range)
+      Provide detailed justification for each score.
+  
+  reporter:
+    name: "ReporterAgent"
+    description: "Generates daily opportunity report in markdown format"
+    system_message: |
+      You are a professional report generator.
+      Compile all validated opportunities into a clear markdown table.
+      Include: Rank, Product Name, Douyin Hot Count, TikTok Status, Market Fit Score,
+      Content Angle, and Additional Notes.
+      Add a summary of top 10 opportunities with actionable insights.
+
+# Group Chat Configuration
+group_chat:
+  max_rounds: 10
+  speaker_selection_method: "round_robin"
