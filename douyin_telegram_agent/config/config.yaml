@@ -1,0 +1,49 @@
+# Douyin Opportunity Finder Configuration
+
+# Agent Settings
+agents:
+  douyin_scout:
+    max_products: 50
+    min_hot_count: 1000
+    retry_attempts: 3
+    retry_delay: 2
+    
+  tiktok_checker:
+    similarity_threshold: 0.8
+    fuzzy_match: true
+    
+  market_validator:
+    llm_provider: groq
+    model: llama-3.3-70b-versatile
+    temperature: 0.3
+    max_tokens: 1000
+    scoring_dimensions:
+      - competition
+      - sentiment
+      - cultural_fit
+      - visual_appeal
+      - price_point
+      
+  reporter:
+    top_n: 20
+    detailed_analysis_n: 10
+    include_charts: false
+
+# API Endpoints
+tikhub:
+  base_url: https://api.tikhub.io
+  billboard_endpoint: /douyin/billboard/fetch_hot_rise_list
+  
+# Data Paths
+paths:
+  data_dir: data
+  logs_dir: logs
+  reports_dir: data
+  us_csv: data/tiktok_products_us.csv
+  uk_csv: data/tiktok_products_uk.csv
+  
+# Logging
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: logs/scan.log

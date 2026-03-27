@@ -68,8 +68,9 @@ douyin_opportunity_finder/
 
 - Python 3.9 or higher
 - TikHub API key ([Get one here](https://tikhub.io/))
-- OpenAI API key (for AG2/LLM features)
+- **Groq API key** (FREE - [Get one here](https://console.groq.com/))
 - Optional: OpenClaw account for advanced scheduling
+- Optional: SMTP credentials for email delivery
 
 ## Installation
 
@@ -239,7 +240,7 @@ Or open in any markdown viewer.
 ### 2. TikTokCheckerAgent
 
 - Loads TikTok product CSVs (US & UK)
-- Translates Chinese titles to English using googletrans
+- Translates Chinese titles to English using **deep-translator**
 - Performs fuzzy matching (SequenceMatcher) with threshold 0.8
 - Returns list of "gap" products (not found on TikTok Shop)
 
@@ -314,7 +315,7 @@ Edit `scheduler.py` and implement `send_notification()` with your preferred meth
 
 ### Translation Failures
 
-- googletrans may be rate-limited
+- deep-translator may be rate-limited
 - System falls back to keyword removal if translation fails
 - Consider using DeepL API for production
 
@@ -379,7 +380,10 @@ Set a reminder to update TikTok product databases weekly:
 | Integration | Status | Notes |
 |-------------|--------|-------|
 | TikHub API | ✅ Implemented | Requires API key |
-| Google Translate | ✅ Implemented | Free tier limitations |
+| Deep Translator | ✅ Implemented | Free, reliable |
+| Groq LLM | ✅ Implemented | FREE - llama-3.3-70b |
+| PDF Generation | ✅ Implemented | Professional reports |
+| Email Delivery | ✅ Implemented | SMTP-based |
 | Amazon Search | ⚠️ Placeholder | Implement OpenClaw skill or API |
 | Reddit Search | ⚠️ Placeholder | Implement PRAW or OpenClaw skill |
 | OpenClaw Skills | ⚠️ Planned | amazon-search, reddit-readonly |

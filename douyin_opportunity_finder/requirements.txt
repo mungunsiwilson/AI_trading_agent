@@ -7,11 +7,9 @@ numpy>=1.24.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 pyyaml>=6.0.1
-googletrans==4.0.0-rc1
-difflib>=0.4.0
+deep-translator>=1.11.0
 aiohttp>=3.9.0
 asyncio>=3.4.3
-logging>=0.5.1.2
 datetime>=5.4
 pytz>=2024.1
 schedule>=1.2.0

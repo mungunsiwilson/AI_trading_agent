@@ -80,7 +80,7 @@ class TikTokCheckerAgent:
     def translate_title(self, chinese_title: str) -> str:
         """
         Translate Chinese title to English.
-        Uses googletrans library with fallback to simple keyword extraction.
+        Uses deep-translator library with fallback to simple keyword extraction.
         
         Args:
             chinese_title: Product title in Chinese.
@@ -89,10 +89,10 @@ class TikTokCheckerAgent:
             Translated English title or simplified version.
         """
         try:
-            from googletrans import Translator
-            translator = Translator()
-            result = translator.translate(chinese_title, src='zh-cn', dest='en')
-            return result.text
+            from deep_translator import GoogleTranslator
+            translator = GoogleTranslator(source='zh-CN', target='en')
+            result = translator.translate(chinese_title)
+            return result
         except Exception as e:
             logger.warning(f"Translation failed: {e}, using fallback")
             # Fallback: remove common Chinese keywords and return remaining

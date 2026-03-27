@@ -1,0 +1,23 @@
+# Core Dependencies
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+httpx>=0.25.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+schedule>=1.2.0
+
+# Translation
+deep-translator>=1.11.0
+
+# PDF Generation
+reportlab>=4.0.0
+
+# AG2 (AutoGen) Framework
+pyautogen>=0.2.0
+
+# LLM Provider (Groq)
+groq>=0.4.0
+
+# Utilities
+tenacity>=8.2.0  # Retry logic
